@@ -1,0 +1,93 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    network_mode: host
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - ${MINIO_DATA_DIR_HOST:-./minio-data}:/data
+    profiles: ["storage"]
+
+  upload-data:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    network_mode: host
+    volumes:
+      - ${LOCAL_M5_DATA_DIR:-./data}:/source/data:ro
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT:-http://192.168.1.10:9000}
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - >
+        test -f /source/data/sales_train_validation.csv &&
+        test -f /source/data/calendar.csv &&
+        test -f /source/data/sell_prices.csv &&
+        mc alias set minio "$${MINIO_ENDPOINT}" "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}" &&
+        mc mb --ignore-existing "minio/$${MINIO_BUCKET}" &&
+        mc mirror --overwrite /source/data "minio/$${MINIO_BUCKET}/data"
+    profiles: ["upload"]
+
+  spark-master:
+    build:
+      context: .
+    image: ${SPARK_IMAGE:-spark-supply-optimizer:dev}
+    network_mode: host
+    command: ["scripts/start_spark_master.sh"]
+    environment:
+      SPARK_MASTER_HOST: ${SPARK_MASTER_HOST:-192.168.1.10}
+      SPARK_MASTER_PORT: ${SPARK_MASTER_PORT:-7077}
+      SPARK_MASTER_WEBUI_PORT: ${SPARK_MASTER_WEBUI_PORT:-8080}
+    volumes:
+      - ${SPARK_PROJECT_ROOT:-.}/src:/app/src
+      - ${SPARK_PROJECT_ROOT:-.}/scripts:/app/scripts
+    profiles: ["master"]
+
+  spark-worker:
+    build:
+      context: .
+    image: ${SPARK_IMAGE:-spark-supply-optimizer:dev}
+    network_mode: host
+    command: ["scripts/start_spark_worker.sh"]
+    environment:
+      SPARK_MASTER_URL: spark://${SPARK_MASTER_HOST:-192.168.1.10}:${SPARK_MASTER_PORT:-7077}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-4g}
+    volumes:
+      - ${SPARK_PROJECT_ROOT:-.}/src:/app/src
+      - ${SPARK_PROJECT_ROOT:-.}/scripts:/app/scripts
+    profiles: ["worker"]
+
+  driver:
+    build:
+      context: .
+    image: ${SPARK_IMAGE:-spark-supply-optimizer:dev}
+    network_mode: host
+    environment:
+      SPARK_LOCAL_IP: ${SPARK_DRIVER_HOST:-192.168.1.20}
+      SPARK_S3_ENDPOINT: ${MINIO_ENDPOINT:-http://192.168.1.10:9000}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - ${SPARK_PROJECT_ROOT:-.}/src:/app/src
+      - ${SPARK_PROJECT_ROOT:-.}/artifacts:/app/artifacts
+    command:
+      - "m5-spark"
+      - "run-pipeline"
+      - "--master"
+      - "spark://${SPARK_MASTER_HOST:-192.168.1.10}:${SPARK_MASTER_PORT:-7077}"
+      - "--data-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/data"
+      - "--features-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/features"
+      - "--model-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/model"
+      - "--predictions-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/predictions"
+      - "--reports-dir"
+      - "artifacts/reports"
+    profiles: ["driver"]

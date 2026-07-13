@@ -1,0 +1,270 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  upload-data:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      - minio
+    volumes:
+      - ./data:/source/data:ro
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+    entrypoint:
+      - "/bin/sh"
+      - "-c"
+      - >
+        test -f /source/data/sales_train_validation.csv &&
+        test -f /source/data/calendar.csv &&
+        test -f /source/data/sell_prices.csv &&
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do sleep 2; done &&
+        mc mb --ignore-existing "local/$${MINIO_BUCKET}" &&
+        mc mirror --overwrite /source/data "local/$${MINIO_BUCKET}/data"
+
+  dev:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    command: ["sleep", "infinity"]
+    working_dir: /app
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+    environment:
+      MINIO_INTEGRATION_ENDPOINT: http://minio:9000
+      SPARK_S3_ENDPOINT: http://minio:9000
+      SPARK_LOCAL_DIR: ${SPARK_LOCAL_DIR:-/app/artifacts/spark-tmp}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    volumes:
+      - .:/app
+    ports:
+      - "5678:5678"
+
+  spark-master:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    command: ["scripts/start_spark_master.sh"]
+    environment:
+      SPARK_MASTER_HOST: "spark-master"
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+
+  spark-worker:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    command: ["scripts/start_spark_worker.sh"]
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MASTER_URL: "spark://spark-master:7077"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "4g"
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+
+  driver:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    profiles: ["driver"]
+    depends_on:
+      - spark-master
+      - spark-worker
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./artifacts:/app/artifacts
+    environment:
+      SPARK_LOCAL_IP: "driver"
+      SPARK_S3_ENDPOINT: ${SPARK_S3_ENDPOINT:-http://minio:9000}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command:
+      - "m5-spark"
+      - "prepare"
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--data-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/data"
+      - "--output-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/features"
+
+  pipeline-s3:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+    environment:
+      SPARK_S3_ENDPOINT: ${SPARK_S3_ENDPOINT:-http://minio:9000}
+      SPARK_LOCAL_DIR: ${SPARK_LOCAL_DIR:-/app/artifacts/spark-tmp}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./artifacts:/app/artifacts
+    command:
+      - "m5-spark"
+      - "run-pipeline"
+      - "--data-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/data"
+      - "--features-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/features"
+      - "--model-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/model"
+      - "--predictions-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/predictions"
+      - "--reports-dir"
+      - "artifacts/reports"
+
+  pipeline-cluster-s3:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    profiles: ["driver"]
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+      spark-worker:
+        condition: service_started
+    environment:
+      SPARK_LOCAL_IP: "pipeline-cluster-s3"
+      SPARK_S3_ENDPOINT: ${SPARK_S3_ENDPOINT:-http://minio:9000}
+      SPARK_LOCAL_DIR: ${SPARK_LOCAL_DIR:-/app/artifacts/spark-tmp}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+    volumes:
+      - ./src:/app/src
+      - ./scripts:/app/scripts
+      - ./artifacts:/app/artifacts
+    command:
+      - "m5-spark"
+      - "run-pipeline"
+      - "--master"
+      - "spark://spark-master:7077"
+      - "--data-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/data"
+      - "--features-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/features"
+      - "--model-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/model"
+      - "--predictions-dir"
+      - "s3a://${MINIO_BUCKET:-m5-data}/artifacts/predictions"
+      - "--reports-dir"
+      - "artifacts/reports"
+
+  test:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./artifacts:/app/artifacts
+    environment:
+      MINIO_INTEGRATION_ENDPOINT: http://minio:9000
+      SPARK_S3_ENDPOINT: http://minio:9000
+      SPARK_LOCAL_DIR: ${SPARK_LOCAL_DIR:-/app/artifacts/spark-tmp}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: ["python", "-m", "pytest"]
+
+  test-image:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+    environment:
+      MINIO_INTEGRATION_ENDPOINT: http://minio:9000
+      SPARK_S3_ENDPOINT: http://minio:9000
+      SPARK_LOCAL_DIR: ${SPARK_LOCAL_DIR:-/app/artifacts/spark-tmp}
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: ["python", "-m", "pytest"]
+
+  test-minio:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    depends_on:
+      upload-data:
+        condition: service_completed_successfully
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    environment:
+      MINIO_INTEGRATION_ENDPOINT: http://minio:9000
+      MINIO_BUCKET: ${MINIO_BUCKET:-m5-data}
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: ["python", "-m", "pytest", "tests/integration/test_minio_s3_runtime.py"]
+
+  lint:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml:ro
+    command: ["python", "-m", "ruff", "check", "."]
+
+  debug-pytest:
+    build:
+      context: .
+    image: spark-supply-optimizer:dev
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "5678:5678"
+    command:
+      - "python"
+      - "-m"
+      - "debugpy"
+      - "--listen"
+      - "0.0.0.0:5678"
+      - "--wait-for-client"
+      - "-m"
+      - "pytest"
+      - "tests/integration/test_spark_runtime.py"
+
+volumes:
+  minio-data:

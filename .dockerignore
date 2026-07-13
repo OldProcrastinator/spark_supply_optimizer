@@ -1,0 +1,11 @@
+.git/
+.idea/
+.agents/
+.venv/
+.uv-cache/
+.pytest_cache/
+.ruff_cache/
+artifacts/
+data/
+__pycache__/
+*.egg-info/
