@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from spark_supply_optimizer.config import M5FeatureConfig, SparkRuntimeConfig
 from spark_supply_optimizer.m5 import (
@@ -34,6 +36,31 @@ def runtime_config(args: argparse.Namespace) -> SparkRuntimeConfig:
         s3_secret_key=args.s3_secret_key,
         auto_tune=not args.no_auto_tune,
     )
+
+
+def validate_s3_endpoint_reachable(config: SparkRuntimeConfig) -> None:
+    """Fail before Spark starts when the configured S3 endpoint hostname is missing."""
+
+    if not config.s3_endpoint:
+        return
+
+    endpoint = urlparse(config.s3_endpoint)
+    hostname = endpoint.hostname
+    if not hostname:
+        raise RuntimeError(
+            f"Invalid S3 endpoint `{config.s3_endpoint}`. Expected a URL like "
+            "`http://minio:9000`."
+        )
+
+    try:
+        socket.getaddrinfo(hostname, endpoint.port or 80)
+    except socket.gaierror as error:
+        raise RuntimeError(
+            f"S3 endpoint host `{hostname}` from `{config.s3_endpoint}` is not resolvable. "
+            "For Docker Compose cluster runs, start MinIO and upload data before the driver: "
+            "`docker compose up -d minio` and `docker compose run --rm upload-data`. "
+            "If you use `docker compose run --no-deps`, Compose will not start MinIO for you."
+        ) from error
 
 
 def feature_config(args: argparse.Namespace) -> M5FeatureConfig:
@@ -310,8 +337,10 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps({**summary, "report_path": args.output_path}, indent=2))
         return
 
+    config = runtime_config(args)
     try:
-        spark = build_spark(runtime_config(args))
+        validate_s3_endpoint_reachable(config)
+        spark = build_spark(config)
     except RuntimeError as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(2) from error

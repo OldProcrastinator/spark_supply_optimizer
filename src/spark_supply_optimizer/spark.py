@@ -129,6 +129,30 @@ def cgroup_memory_limit_bytes() -> int | None:
     return None
 
 
+def system_memory_bytes() -> int | None:
+    """Return physical memory visible from Linux /proc when cgroups do not expose a limit."""
+
+    meminfo = Path("/proc/meminfo")
+    try:
+        lines = meminfo.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        if not line.startswith("MemTotal:"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            return int(parts[1]) * 1024
+    return None
+
+
+def effective_memory_limit_bytes() -> int | None:
+    """Return the best memory budget signal available to the Spark driver."""
+
+    return cgroup_memory_limit_bytes() or system_memory_bytes()
+
+
 def auto_driver_memory(memory_limit_bytes: int | None) -> str | None:
     """Choose driver memory from visible container memory without capping CPU."""
 
@@ -144,12 +168,18 @@ def auto_driver_memory(memory_limit_bytes: int | None) -> str | None:
 def driver_process_resources() -> dict[str, object]:
     """Return resources visible to the Python driver process."""
 
-    memory_limit = cgroup_memory_limit_bytes()
+    cgroup_memory_limit = cgroup_memory_limit_bytes()
+    physical_memory = system_memory_bytes()
+    effective_memory_limit = cgroup_memory_limit or physical_memory
     return {
         "hostname": socket.gethostname(),
         "cpu_count_visible": os.cpu_count(),
-        "memory_limit_bytes": memory_limit,
-        "memory_limit_gib": bytes_to_gib(memory_limit),
+        "cgroup_memory_limit_bytes": cgroup_memory_limit,
+        "cgroup_memory_limit_gib": bytes_to_gib(cgroup_memory_limit),
+        "physical_memory_bytes": physical_memory,
+        "physical_memory_gib": bytes_to_gib(physical_memory),
+        "effective_memory_limit_bytes": effective_memory_limit,
+        "effective_memory_limit_gib": bytes_to_gib(effective_memory_limit),
     }
 
 
@@ -211,7 +241,7 @@ def build_spark(config: SparkRuntimeConfig) -> SparkSession:
 
     effective_driver_memory = config.driver_memory
     if config.auto_tune and effective_driver_memory is None:
-        effective_driver_memory = auto_driver_memory(cgroup_memory_limit_bytes())
+        effective_driver_memory = auto_driver_memory(effective_memory_limit_bytes())
 
     builder = SparkSession.builder.appName(config.app_name)
     if config.master:
@@ -219,6 +249,13 @@ def build_spark(config: SparkRuntimeConfig) -> SparkSession:
 
     builder = builder.config("spark.sql.adaptive.enabled", "true")
     builder = builder.config("spark.sql.execution.arrow.pyspark.enabled", "false")
+    builder = builder.config("spark.ui.enabled", "true")
+    builder = builder.config("spark.ui.port", "4040")
+    builder = builder.config("spark.ui.bindAddress", "0.0.0.0")
+    builder = builder.config("spark.executor.heartbeatInterval", "60s")
+    builder = builder.config("spark.network.timeout", "600s")
+    builder = builder.config("spark.hadoop.parquet.block.size", "16777216")
+    builder = builder.config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
 
     if config.s3_endpoint:
         builder = configure_s3a(builder, config)

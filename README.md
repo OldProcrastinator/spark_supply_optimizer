@@ -61,7 +61,7 @@ docker compose up -d minio
 docker compose run --rm upload-data
 docker compose up -d spark-master
 docker compose up -d --scale spark-worker=2 spark-worker
-docker compose --profile driver run --rm pipeline-cluster-s3
+docker compose --profile driver up --no-deps pipeline-cluster-s3
 ```
 
 Spark UI:
@@ -70,10 +70,163 @@ Spark UI:
 http://localhost:8080
 ```
 
+Spark Application UI во время выполнения pipeline:
+
+```text
+http://localhost:4040
+```
+
 Остановить:
 
 ```powershell
 docker compose down
+```
+
+## Последовательный Запуск Сервисов Для Проверки Кластера
+
+Этот сценарий полезен, когда нужно руками увидеть в Spark UI, как по очереди
+появляются master, workers и приложение driver. Все запускается на одном
+компьютере, но каждый worker живет в отдельном Docker container.
+
+1. Почистить старые одноразовые контейнеры:
+
+```powershell
+docker compose down --remove-orphans
+```
+
+2. Собрать Docker image:
+
+```powershell
+docker compose build
+```
+
+3. Запустить MinIO:
+
+```powershell
+docker compose up -d minio
+```
+
+MinIO UI:
+
+```text
+http://localhost:9001
+login: minioadmin
+password: minioadmin123
+```
+
+4. Загрузить CSV из `data/` в MinIO bucket:
+
+```powershell
+docker compose run --rm upload-data
+```
+
+Этот шаг обязателен перед запуском driver. Команда driver ниже использует
+`--no-deps`, поэтому Docker Compose не будет автоматически поднимать `minio` и
+`upload-data`. Если начать сразу с workers и driver, Spark упадет с ошибкой
+`UnknownHostException: minio`.
+
+5. Запустить Spark master:
+
+```powershell
+docker compose up -d spark-master
+```
+
+Spark Master UI:
+
+```text
+http://localhost:8080
+```
+
+Сразу после запуска master там будет `Workers: 0`.
+
+6. Запустить первый worker:
+
+```powershell
+docker compose up -d spark-worker
+```
+
+Обновите `http://localhost:8080`: должен появиться один worker.
+
+7. Увеличить количество workers:
+
+```powershell
+docker compose up -d --scale spark-worker=2 spark-worker
+docker compose up -d --scale spark-worker=3 spark-worker
+```
+
+После каждой команды обновляйте Spark UI. Количество workers, cores и memory
+должно изменяться.
+
+По умолчанию `spark-worker` не получает `SPARK_WORKER_CORES` и
+`SPARK_WORKER_MEMORY`, поэтому Spark берет доступные ресурсы контейнера/хоста.
+Ограничения можно задать вручную через эти env-переменные, если это нужно для
+эксперимента.
+
+Важно для одного физического компьютера: если поднять 3 workers без лимитов, то
+каждый container увидит почти весь хост и Spark зарегистрирует, например, три
+workers по `20 cores` и `30 GiB RAM`. Это нормально для настоящих разных машин,
+но на одном ПК это оверкоммит и Docker Desktop может упасть с `unexpected EOF`
+или остановить containers с `Exited (255)`.
+
+Для безопасной локальной имитации нескольких машин временно задайте ресурсы
+только на команду запуска workers:
+
+```powershell
+$env:SPARK_WORKER_CORES="4"
+$env:SPARK_WORKER_MEMORY="8g"
+docker compose up -d --scale spark-worker=3 spark-worker
+Remove-Item Env:\SPARK_WORKER_CORES
+Remove-Item Env:\SPARK_WORKER_MEMORY
+```
+
+Для реального запуска на нескольких физических компьютерах эти переменные можно
+не задавать: каждый worker будет использовать ресурсы своей машины.
+
+8. Запустить полный pipeline подготовки, обучения, предсказания и benchmark через cluster driver:
+
+```powershell
+docker compose --profile driver up --no-deps pipeline-cluster-s3
+```
+
+Во время выполнения:
+
+- Spark Master UI: `http://localhost:8080` - показывает workers, cores, memory и running applications.
+- Spark Application UI: `http://localhost:4040` - показывает jobs, stages, tasks, executors, SQL plans и storage.
+
+Application UI живет только пока работает driver/pipeline. После завершения
+контейнера порт `4040` закрывается.
+
+Если нужно повторить запуск после завершения pipeline, удалите старый driver
+container:
+
+```powershell
+docker compose rm -f pipeline-cluster-s3
+```
+
+Результаты будут в MinIO:
+
+```text
+s3a://m5-data/artifacts/features
+s3a://m5-data/artifacts/model
+s3a://m5-data/artifacts/predictions
+```
+
+Локальные JSON reports будут в:
+
+```text
+artifacts/reports/
+```
+
+9. Остановить кластер:
+
+```powershell
+docker compose down
+```
+
+Удалить еще и данные MinIO volume:
+
+```powershell
+docker compose down -v
 ```
 
 ## Запуск На Нескольких Компьютерах
@@ -173,6 +326,18 @@ s3a://m5-data/data/*.csv
 - `m5-spark benchmark` - запускает Spark aggregation для сравнения скорости.
 - `m5-spark summarize-reports` - собирает JSON reports.
 - `m5-spark run-pipeline` - запускает все этапы подряд.
+
+Runtime defaults:
+
+- Spark still uses `local[*]` by default, so CPU threads are not capped.
+- Driver memory is auto-tuned from cgroup memory or `/proc/meminfo`; set
+  `SPARK_DRIVER_MEMORY` to override it.
+- `prepare` writes features in 16-day chunks. This avoids huge Spark codegen plans
+  and large sort/write memory spikes on the full M5 dataset.
+- `prepare` does not auto-repartition output by default. Use `--output-partitions N`
+  or opt in to `--auto-output-partitions` only when you really want an extra shuffle.
+- Parquet row groups are reduced to 16 MiB so many concurrent local writers do not
+  exhaust JVM heap on machines with many CPU cores.
 
 ## Почему MinIO
 

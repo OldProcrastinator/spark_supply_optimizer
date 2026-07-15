@@ -55,8 +55,8 @@ services:
     command: ["scripts/start_spark_worker.sh"]
     environment:
       SPARK_MASTER_URL: spark://${SPARK_MASTER_HOST:-192.168.1.10}:${SPARK_MASTER_PORT:-7077}
-      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-2}
-      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-4g}
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-}
     volumes:
       - ${SPARK_PROJECT_ROOT:-.}/src:/app/src
       - ${SPARK_PROJECT_ROOT:-.}/scripts:/app/scripts

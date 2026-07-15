@@ -9,6 +9,7 @@ from spark_supply_optimizer.spark import (
     auto_driver_memory,
     configure_python_executable,
     configure_s3a,
+    effective_memory_limit_bytes,
     java_executable_from_home,
     local_threads_from_master,
     validate_java_runtime,
@@ -121,8 +122,23 @@ def test_build_spark_applies_local_dir_and_memory(
     assert fake_builder.options["spark.master"] == "local[2]"
     assert fake_builder.options["spark.driver.memory"] == "6g"
     assert fake_builder.options["spark.local.dir"] == str(tmp_path / "spark-tmp")
+    assert fake_builder.options["spark.ui.enabled"] == "true"
+    assert fake_builder.options["spark.ui.port"] == "4040"
+    assert fake_builder.options["spark.ui.bindAddress"] == "0.0.0.0"
+    assert fake_builder.options["spark.executor.heartbeatInterval"] == "60s"
+    assert fake_builder.options["spark.network.timeout"] == "600s"
+    assert fake_builder.options["spark.hadoop.parquet.block.size"] == "16777216"
 
 
 def test_auto_driver_memory_uses_container_memory_without_capping_cpu() -> None:
     assert auto_driver_memory(8 * 1024**3) == "6g"
     assert auto_driver_memory(None) is None
+
+
+def test_effective_memory_limit_falls_back_to_visible_system_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("spark_supply_optimizer.spark.cgroup_memory_limit_bytes", lambda: None)
+    monkeypatch.setattr("spark_supply_optimizer.spark.system_memory_bytes", lambda: 16 * 1024**3)
+
+    assert effective_memory_limit_bytes() == 16 * 1024**3

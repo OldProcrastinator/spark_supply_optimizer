@@ -1,9 +1,16 @@
 import json
+import socket
 
 import pytest
 
 from spark_supply_optimizer import cli
-from spark_supply_optimizer.cli import runtime_config, summarize_stage_reports, write_json_report
+from spark_supply_optimizer.cli import (
+    runtime_config,
+    summarize_stage_reports,
+    validate_s3_endpoint_reachable,
+    write_json_report,
+)
+from spark_supply_optimizer.config import SparkRuntimeConfig
 
 
 def test_write_json_report_creates_parent_directory(tmp_path) -> None:
@@ -76,3 +83,18 @@ def test_runtime_args_keep_all_cpu_but_use_safe_docker_env(monkeypatch: pytest.M
     assert config.local_dir == "/app/artifacts/spark-tmp"
     assert config.s3_endpoint == "http://minio:9000"
     assert config.auto_tune is True
+
+
+def test_s3_endpoint_preflight_reports_missing_minio_cleanly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_unknown_host(*args, **kwargs):
+        raise socket.gaierror("Name or service not known")
+
+    monkeypatch.setattr("spark_supply_optimizer.cli.socket.getaddrinfo", raise_unknown_host)
+
+    with pytest.raises(RuntimeError, match="docker compose up -d minio") as error:
+        validate_s3_endpoint_reachable(SparkRuntimeConfig(s3_endpoint="http://minio:9000"))
+
+    assert "docker compose run --rm upload-data" in str(error.value)
+    assert "--no-deps" in str(error.value)

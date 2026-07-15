@@ -78,8 +78,6 @@ services:
       - spark-master
     environment:
       SPARK_MASTER_URL: "spark://spark-master:7077"
-      SPARK_WORKER_CORES: "2"
-      SPARK_WORKER_MEMORY: "4g"
     volumes:
       - ./src:/app/src
       - ./scripts:/app/scripts
@@ -88,6 +86,7 @@ services:
     build:
       context: .
     image: spark-supply-optimizer:dev
+    hostname: driver
     profiles: ["driver"]
     depends_on:
       - spark-master
@@ -96,6 +95,8 @@ services:
       - ./src:/app/src
       - ./scripts:/app/scripts
       - ./artifacts:/app/artifacts
+    ports:
+      - "4040:4040"
     environment:
       SPARK_LOCAL_IP: "driver"
       SPARK_S3_ENDPOINT: ${SPARK_S3_ENDPOINT:-http://minio:9000}
@@ -128,6 +129,8 @@ services:
       - ./src:/app/src
       - ./scripts:/app/scripts
       - ./artifacts:/app/artifacts
+    ports:
+      - "4040:4040"
     command:
       - "m5-spark"
       - "run-pipeline"
@@ -146,6 +149,7 @@ services:
     build:
       context: .
     image: spark-supply-optimizer:dev
+    hostname: pipeline-cluster-s3
     profiles: ["driver"]
     depends_on:
       upload-data:
@@ -165,6 +169,8 @@ services:
       - ./src:/app/src
       - ./scripts:/app/scripts
       - ./artifacts:/app/artifacts
+    ports:
+      - "4040:4040"
     command:
       - "m5-spark"
       - "run-pipeline"
